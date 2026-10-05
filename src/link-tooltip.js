@@ -14,6 +14,8 @@ export class LinkTooltip {
     this.hideTimeout = null;
     this.visibilityChangeHandler = null;
     this.isTooltipHovered = false;
+    this.linkCacheText = null;
+    this.linkCache = [];
 
     this.init();
   }
@@ -22,30 +24,32 @@ export class LinkTooltip {
     // Create tooltip element
     this.createTooltip();
 
-    // Listen for cursor position changes
-    this.editor.textarea.addEventListener('selectionchange', () => this.checkCursorPosition());
-    this.editor.textarea.addEventListener('keyup', e => {
-      if (e.key.includes('Arrow') || e.key === 'Home' || e.key === 'End') {
-        this.checkCursorPosition();
+    this.textareaListeners = {
+      // Listen for cursor position changes
+      selectionchange: () => this.checkCursorPosition(),
+      keyup: e => {
+        if (e.key.includes('Arrow') || e.key === 'Home' || e.key === 'End') {
+          this.checkCursorPosition();
+        }
+      },
+      // Hide tooltip when typing
+      input: () => this.hide(),
+      // Reposition tooltip when scrolling
+      scroll: () => {
+        if (this.currentLink) {
+          this.positionTooltip(this.currentLink);
+        }
+      },
+      // Hide tooltip when textarea loses focus (unless hovering tooltip)
+      blur: () => {
+        if (!this.isTooltipHovered) {
+          this.hide();
+        }
       }
-    });
-
-    // Hide tooltip when typing
-    this.editor.textarea.addEventListener('input', () => this.hide());
-
-    // Reposition tooltip when scrolling
-    this.editor.textarea.addEventListener('scroll', () => {
-      if (this.currentLink) {
-        this.positionTooltip(this.currentLink);
-      }
-    });
-
-    // Hide tooltip when textarea loses focus (unless hovering tooltip)
-    this.editor.textarea.addEventListener('blur', () => {
-      if (!this.isTooltipHovered) {
-        this.hide();
-      }
-    });
+    };
+    for (const [type, handler] of Object.entries(this.textareaListeners)) {
+      this.editor.textarea.addEventListener(type, handler);
+    }
 
     // Hide tooltip when page loses visibility (tab switch, minimize, etc.)
     this.visibilityChangeHandler = () => {
@@ -69,6 +73,7 @@ export class LinkTooltip {
   createTooltip() {
     this.tooltip = document.createElement('div');
     this.tooltip.className = 'overtype-link-tooltip';
+    this.editor._markChrome(this.tooltip);
 
     // Add link icon and text container
     this.tooltip.innerHTML = `
@@ -115,25 +120,27 @@ export class LinkTooltip {
   }
 
   findLinkAtPosition(text, position) {
-    // Regex to find markdown links: [text](url)
-    const linkRegex = /\[([^\]]+)\]\(([^)]+)\)/g;
-    let match;
-    let linkIndex = 0;
+    if (this.editor.options.showActiveLineRaw) return null;
 
-    while ((match = linkRegex.exec(text)) !== null) {
-      const start = match.index;
-      const end = match.index + match[0].length;
+    if (this.linkCacheText !== text) {
+      this.linkCacheText = text;
+      this.linkCache = MarkdownParser.findRenderableLinks(text);
+    }
+    const links = this.linkCache;
+
+    for (const [linkIndex, link] of links.entries()) {
+      const start = link.start;
+      const end = link.end;
 
       if (position >= start && position <= end) {
         return {
-          text: match[1],
-          url: this.transformUrl(match[2]),
+          text: link.text.raw,
+          url: this.transformUrl(link.destination.value),
           index: linkIndex,
-          start: start,
-          end: end
+          start,
+          end
         };
       }
-      linkIndex++;
     }
 
     return null;
@@ -230,6 +237,13 @@ export class LinkTooltip {
 
   destroy() {
     this.cancelHide();
+
+    if (this.textareaListeners) {
+      for (const [type, handler] of Object.entries(this.textareaListeners)) {
+        this.editor.textarea.removeEventListener(type, handler);
+      }
+      this.textareaListeners = null;
+    }
 
     if (this.visibilityChangeHandler) {
       document.removeEventListener('visibilitychange', this.visibilityChangeHandler);

@@ -1,5 +1,5 @@
 /**
- * OverType v2.4.0
+ * OverType v2.6.0
  * A lightweight markdown editor library with perfect WYSIWYG alignment
  * @license MIT
  * @author David Miranda
@@ -35,7 +35,708 @@ var OverTypeEditor = (() => {
     default: () => overtype_webcomponent_default
   });
 
+  // src/block-scanner.js
+  function scanAtxHeading(line) {
+    var _a, _b;
+    const match = /^( {0,3})(#{1,6})(?:([\t ]+)(.*)|$)/.exec(line);
+    if (!match || match[2].length > 3)
+      return null;
+    const indent = match[1];
+    const marker = match[2];
+    const separator = (_a = match[3]) != null ? _a : "";
+    const body = (_b = match[4]) != null ? _b : "";
+    const onlyClosingMarker = /^(#+)[\t ]*$/.exec(body);
+    const closingMatch = /([\t ]+)(#+)([\t ]*)$/.exec(body);
+    const hasClosingMarker = onlyClosingMarker || closingMatch;
+    return {
+      type: "heading",
+      level: marker.length,
+      indent,
+      marker,
+      separator,
+      content: onlyClosingMarker ? "" : hasClosingMarker ? body.slice(0, closingMatch.index) : body,
+      closing: onlyClosingMarker ? body : hasClosingMarker ? closingMatch[0] : ""
+    };
+  }
+  function scanThematicBreak(line) {
+    const match = /^( {0,3})([*_-])([\t *_-]*)$/.exec(line);
+    if (!match)
+      return null;
+    const marker = match[2];
+    const rest = match[3];
+    if ([...rest].some((character) => character !== marker && character !== " " && character !== "	")) {
+      return null;
+    }
+    const markerCount = 1 + [...rest].filter((character) => character === marker).length;
+    if (markerCount < 3)
+      return null;
+    return { type: "thematic-break", marker, source: line };
+  }
+  function scanBlockquote(line) {
+    const match = /^( {0,3})>([\t ]?)(.*)$/.exec(line);
+    if (!match || match[2] === "" && match[3].startsWith(">"))
+      return null;
+    return {
+      type: "blockquote",
+      indent: match[1],
+      marker: ">",
+      separator: match[2],
+      content: match[3]
+    };
+  }
+  function scanListItem(line) {
+    const bullet = /^( *)([-*+])([\t ]+)(.*)$/.exec(line);
+    if (bullet) {
+      return {
+        type: "list-item",
+        listType: "bullet",
+        indent: bullet[1],
+        marker: bullet[2],
+        separator: bullet[3],
+        content: bullet[4]
+      };
+    }
+    const emptyBullet = /^( *)([-*+])$/.exec(line);
+    if (emptyBullet) {
+      return {
+        type: "list-item",
+        listType: "bullet",
+        indent: emptyBullet[1],
+        marker: emptyBullet[2],
+        separator: "",
+        content: ""
+      };
+    }
+    const ordered = /^( *)(\d{1,9}\.)([\t ]+)(.*)$/.exec(line);
+    if (ordered) {
+      return {
+        type: "list-item",
+        listType: "ordered",
+        indent: ordered[1],
+        marker: ordered[2],
+        separator: ordered[3],
+        content: ordered[4]
+      };
+    }
+    const emptyOrdered = /^( *)(\d{1,9}\.)$/.exec(line);
+    if (emptyOrdered) {
+      return {
+        type: "list-item",
+        listType: "ordered",
+        indent: emptyOrdered[1],
+        marker: emptyOrdered[2],
+        separator: "",
+        content: ""
+      };
+    }
+    return null;
+  }
+  function scanFenceOpen(line) {
+    const match = /^( {0,3})(`{3,})([^`]*)$/.exec(line);
+    if (!match)
+      return null;
+    return {
+      type: "fence-open",
+      indent: match[1],
+      marker: match[2],
+      length: match[2].length,
+      info: match[3].trim(),
+      source: line
+    };
+  }
+  function scanFenceClose(line, opening) {
+    const match = /^( {0,3})(`{3,})[\t ]*$/.exec(line);
+    if (!match || match[2].length < opening.length)
+      return null;
+    return {
+      type: "fence-close",
+      indent: match[1],
+      marker: match[2],
+      length: match[2].length,
+      source: line
+    };
+  }
+
+  // src/link-scanner.js
+  var ESCAPABLE = /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/;
+  var ENTITY = /^&(?:amp|lt|gt|quot|#39);/;
+  var DECODED_ENTITY = {
+    "&amp;": "&",
+    "&lt;": "<",
+    "&gt;": ">",
+    "&quot;": '"',
+    "&#39;": "'"
+  };
+  function makeReader(text, htmlEntities) {
+    return function at(index) {
+      if (index >= text.length)
+        return [null, 0];
+      if (htmlEntities && text.charCodeAt(index) === 38) {
+        const match = ENTITY.exec(text.slice(index, index + 6));
+        if (match)
+          return [DECODED_ENTITY[match[0]], match[0].length];
+      }
+      return [text[index], 1];
+    };
+  }
+  function isEscaped(text, index) {
+    let slashes = 0;
+    while (index > 0 && text[--index] === "\\")
+      slashes++;
+    return slashes % 2 === 1;
+  }
+  var isSpace = (character) => character === " " || character === "	";
+  var isControl = (character) => character !== null && (character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127);
+  function scanTail(text, index, at, maxParenDepth) {
+    let [character, length] = at(index);
+    if (character !== "(")
+      return null;
+    index += length;
+    while (isSpace(character = at(index)[0]))
+      index += at(index)[1];
+    let destination = null;
+    [character, length] = at(index);
+    if (character === "<") {
+      const start = index;
+      let value = "";
+      index += length;
+      for (; ; ) {
+        [character, length] = at(index);
+        if (character === null || character === "<" || character === "\n")
+          return null;
+        if (character === "\\") {
+          const [next, nextLength] = at(index + length);
+          if (next !== null && ESCAPABLE.test(next)) {
+            value += next;
+            index += length + nextLength;
+            continue;
+          }
+        }
+        if (character === ">") {
+          index += length;
+          break;
+        }
+        value += character;
+        index += length;
+      }
+      destination = {
+        start,
+        end: index,
+        raw: text.slice(start, index),
+        value
+      };
+    } else if (character !== ")") {
+      const start = index;
+      let depth = 0;
+      let value = "";
+      for (; ; ) {
+        [character, length] = at(index);
+        if (character === null || character === "\n" || isSpace(character))
+          break;
+        if (isControl(character))
+          return null;
+        if (character === "\\") {
+          const [next, nextLength] = at(index + length);
+          if (next !== null && ESCAPABLE.test(next)) {
+            value += next;
+            index += length + nextLength;
+            continue;
+          }
+          value += character;
+          index += length;
+          continue;
+        }
+        if (character === "(") {
+          depth++;
+          if (depth > maxParenDepth)
+            return null;
+          value += character;
+          index += length;
+          continue;
+        }
+        if (character === ")") {
+          if (depth === 0)
+            break;
+          depth--;
+          value += character;
+          index += length;
+          continue;
+        }
+        value += character;
+        index += length;
+      }
+      if (depth !== 0)
+        return null;
+      destination = {
+        start,
+        end: index,
+        raw: text.slice(start, index),
+        value
+      };
+    }
+    const afterDestination = index;
+    while (isSpace(character = at(index)[0]))
+      index += at(index)[1];
+    let title = null;
+    [character, length] = at(index);
+    if (character === '"' || character === "'" || character === "(") {
+      if (destination && index === afterDestination)
+        return null;
+      const close = character === "(" ? ")" : character;
+      const start = index;
+      let value = "";
+      index += length;
+      for (; ; ) {
+        [character, length] = at(index);
+        if (character === null || character === "\n")
+          return null;
+        if (character === "\\") {
+          const [next, nextLength] = at(index + length);
+          if (next !== null && ESCAPABLE.test(next)) {
+            value += next;
+            index += length + nextLength;
+            continue;
+          }
+          value += character;
+          index += length;
+          continue;
+        }
+        if (character === close) {
+          index += length;
+          break;
+        }
+        if (close === ")" && character === "(")
+          return null;
+        value += character;
+        index += length;
+      }
+      title = {
+        start,
+        end: index,
+        raw: text.slice(start, index),
+        value,
+        delimiter: close === ")" ? "(" : close
+      };
+      while (isSpace(character = at(index)[0]))
+        index += at(index)[1];
+    }
+    [character, length] = at(index);
+    if (character !== ")")
+      return null;
+    return { end: index + length, destination, title };
+  }
+  function rangeAt(ranges, index, rangeIndex) {
+    while (rangeIndex < ranges.length && ranges[rangeIndex].end <= index)
+      rangeIndex++;
+    const range = ranges[rangeIndex];
+    return {
+      range: range && range.start <= index && index < range.end ? range : null,
+      rangeIndex
+    };
+  }
+  function findLinks(text, {
+    htmlEntities = false,
+    maxParenDepth = 32,
+    ignoreRanges = []
+  } = {}) {
+    const at = makeReader(text, htmlEntities);
+    const ranges = [...ignoreRanges].sort((a, b) => a.start - b.start);
+    const links = [];
+    const openers = [];
+    let rangeIndex = 0;
+    let index = 0;
+    while (index < text.length) {
+      const rangeResult = rangeAt(ranges, index, rangeIndex);
+      rangeIndex = rangeResult.rangeIndex;
+      if (rangeResult.range) {
+        index = rangeResult.range.end;
+        continue;
+      }
+      const [character, length] = at(index);
+      if (character === "\\") {
+        const [next, nextLength] = at(index + length);
+        index += next !== null && ESCAPABLE.test(next) ? length + nextLength : length;
+        continue;
+      }
+      if (character === "\n") {
+        openers.length = 0;
+        index += length;
+        continue;
+      }
+      if (character === "[") {
+        const imageMarker = index > 0 && text[index - 1] === "!" && !isEscaped(text, index - 1);
+        openers.push({ index, image: imageMarker });
+        index += length;
+        continue;
+      }
+      if (character === "]") {
+        const opener = openers.pop();
+        if (opener) {
+          const tail = scanTail(text, index + length, at, maxParenDepth);
+          if (tail) {
+            links.push({
+              start: opener.index,
+              end: tail.end,
+              image: opener.image,
+              text: {
+                start: opener.index + 1,
+                end: index,
+                raw: text.slice(opener.index + 1, index)
+              },
+              destination: tail.destination,
+              title: tail.title
+            });
+            openers.length = 0;
+            index = tail.end;
+            continue;
+          }
+        }
+      }
+      index += length;
+    }
+    return links;
+  }
+  function findCodeSpans(text, excludedRanges = []) {
+    const runs = [];
+    const spans = [];
+    let index = 0;
+    while (index < text.length) {
+      if (text[index] !== "`") {
+        index++;
+        continue;
+      }
+      const start = index;
+      while (text[index] === "`")
+        index++;
+      runs.push({ start, end: index, length: index - start });
+    }
+    const nextRun = new Array(runs.length);
+    const lastRunByLength = /* @__PURE__ */ new Map();
+    for (let runIndex = runs.length - 1; runIndex >= 0; runIndex--) {
+      const run = runs[runIndex];
+      nextRun[runIndex] = lastRunByLength.get(run.length);
+      lastRunByLength.set(run.length, runIndex);
+    }
+    for (let runIndex = 0; runIndex < runs.length; ) {
+      const open = runs[runIndex];
+      const excluded = isEscaped(text, open.start) || excludedRanges.some((range) => open.start >= range.start && open.start < range.end);
+      const closeIndex = nextRun[runIndex];
+      if (excluded || closeIndex === void 0) {
+        runIndex++;
+        continue;
+      }
+      const close = runs[closeIndex];
+      spans.push({
+        start: open.start,
+        end: close.end,
+        raw: text.slice(open.start, close.end),
+        openTicks: text.slice(open.start, open.end),
+        content: text.slice(open.end, close.start),
+        closeTicks: text.slice(close.start, close.end)
+      });
+      runIndex = closeIndex + 1;
+    }
+    return spans;
+  }
+  function shiftLink(link, offset3) {
+    return {
+      ...link,
+      start: link.start + offset3,
+      end: link.end + offset3,
+      text: {
+        ...link.text,
+        start: link.text.start + offset3,
+        end: link.text.end + offset3
+      },
+      destination: link.destination && {
+        ...link.destination,
+        start: link.destination.start + offset3,
+        end: link.destination.end + offset3
+      },
+      title: link.title && {
+        ...link.title,
+        start: link.title.start + offset3,
+        end: link.title.end + offset3
+      }
+    };
+  }
+  function findRenderableLineLinks(text, options) {
+    if (!text.includes("["))
+      return [];
+    let links = findLinks(text, options);
+    const seen = /* @__PURE__ */ new Set();
+    for (; ; ) {
+      const signature = links.map((link) => `${link.start}:${link.end}`).join(",");
+      if (seen.has(signature))
+        return links;
+      seen.add(signature);
+      const targetRanges = links.map((link) => ({
+        start: link.text.end,
+        end: link.end
+      }));
+      const codeRanges = findCodeSpans(text, targetRanges);
+      const next = findLinks(text, { ...options, ignoreRanges: codeRanges });
+      const nextSignature = next.map((link) => `${link.start}:${link.end}`).join(",");
+      if (nextSignature === signature)
+        return next;
+      links = next;
+    }
+  }
+  function findRenderableLinks(text, options = {}) {
+    const links = [];
+    const lines = text.split("\n");
+    let opening = null;
+    let offset3 = 0;
+    for (const line of lines) {
+      if (opening) {
+        if (scanFenceClose(line, opening))
+          opening = null;
+      } else {
+        const candidate = scanFenceOpen(line);
+        if (candidate)
+          opening = candidate;
+        else {
+          links.push(...findRenderableLineLinks(line, options).map((link) => shiftLink(link, offset3)));
+        }
+      }
+      offset3 += line.length + 1;
+    }
+    return links;
+  }
+
+  // src/emphasis-scanner.js
+  var DECODED_ENTITY2 = {
+    "&amp;": "&",
+    "&lt;": "<",
+    "&gt;": ">",
+    "&quot;": '"',
+    "&#39;": "'"
+  };
+  var ENTITY2 = /^&(amp|lt|gt|quot|#39);/;
+  var ASCII_PUNCTUATION = /^[!"#$%&'()*+,\-./:;<=>?@[\]\\^_`{|}~]$/;
+  var BMP_PUNCTUATION = /^[\u00a1-\u00a9\u00ab-\u00ac\u00ae-\u00b1\u00b4\u00b6-\u00b8\u00bb\u00bf\u00d7\u00f7\u02c2-\u02c5\u02d2-\u02df\u02e5-\u02eb\u02ed\u02ef-\u02ff\u0375\u037e\u0384-\u0385\u0387\u03f6\u0482\u055a-\u055f\u0589-\u058a\u058d-\u058f\u05be\u05c0\u05c3\u05c6\u05f3-\u05f4\u0606-\u060f\u061b\u061d-\u061f\u066a-\u066d\u06d4\u06de\u06e9\u06fd-\u06fe\u0700-\u070d\u07f6-\u07f9\u07fe-\u07ff\u0830-\u083e\u085e\u0888\u0964-\u0965\u0970\u09f2-\u09f3\u09fa-\u09fb\u09fd\u0a76\u0af0-\u0af1\u0b70\u0bf3-\u0bfa\u0c77\u0c7f\u0c84\u0d4f\u0d79\u0df4\u0e3f\u0e4f\u0e5a-\u0e5b\u0f01-\u0f17\u0f1a-\u0f1f\u0f34\u0f36\u0f38\u0f3a-\u0f3d\u0f85\u0fbe-\u0fc5\u0fc7-\u0fcc\u0fce-\u0fda\u104a-\u104f\u109e-\u109f\u10fb\u1360-\u1368\u1390-\u1399\u1400\u166d-\u166e\u169b-\u169c\u16eb-\u16ed\u1735-\u1736\u17d4-\u17d6\u17d8-\u17db\u1800-\u180a\u1940\u1944-\u1945\u19de-\u19ff\u1a1e-\u1a1f\u1aa0-\u1aa6\u1aa8-\u1aad\u1b4e-\u1b4f\u1b5a-\u1b6a\u1b74-\u1b7f\u1bfc-\u1bff\u1c3b-\u1c3f\u1c7e-\u1c7f\u1cc0-\u1cc7\u1cd3\u1fbd\u1fbf-\u1fc1\u1fcd-\u1fcf\u1fdd-\u1fdf\u1fed-\u1fef\u1ffd-\u1ffe\u2010-\u2027\u2030-\u205e\u207a-\u207e\u208a-\u208e\u20a0-\u20c0\u2100-\u2101\u2103-\u2106\u2108-\u2109\u2114\u2116-\u2118\u211e-\u2123\u2125\u2127\u2129\u212e\u213a-\u213b\u2140-\u2144\u214a-\u214d\u214f\u218a-\u218b\u2190-\u2429\u2440-\u244a\u249c-\u24e9\u2500-\u2775\u2794-\u2b73\u2b76-\u2b95\u2b97-\u2bff\u2ce5-\u2cea\u2cf9-\u2cfc\u2cfe-\u2cff\u2d70\u2e00-\u2e2e\u2e30-\u2e5d\u2e80-\u2e99\u2e9b-\u2ef3\u2f00-\u2fd5\u2ff0-\u2fff\u3001-\u3004\u3008-\u3020\u3030\u3036-\u3037\u303d-\u303f\u309b-\u309c\u30a0\u30fb\u3190-\u3191\u3196-\u319f\u31c0-\u31e5\u31ef\u3200-\u321e\u322a-\u3247\u3250\u3260-\u327f\u328a-\u32b0\u32c0-\u33ff\u4dc0-\u4dff\ua490-\ua4c6\ua4fe-\ua4ff\ua60d-\ua60f\ua673\ua67e\ua6f2-\ua6f7\ua700-\ua716\ua720-\ua721\ua789-\ua78a\ua828-\ua82b\ua836-\ua839\ua874-\ua877\ua8ce-\ua8cf\ua8f8-\ua8fa\ua8fc\ua92e-\ua92f\ua95f\ua9c1-\ua9cd\ua9de-\ua9df\uaa5c-\uaa5f\uaa77-\uaa79\uaade-\uaadf\uaaf0-\uaaf1\uab5b\uab6a-\uab6b\uabeb\ufb29\ufbb2-\ufbc2\ufd3e-\ufd4f\ufdcf\ufdfc-\ufdff\ufe10-\ufe19\ufe30-\ufe52\ufe54-\ufe66\ufe68-\ufe6b\uff01-\uff0f\uff1a-\uff20\uff3b-\uff40\uff5b-\uff65\uffe0-\uffe6\uffe8-\uffee\ufffc-\ufffd]$/;
+  var PLACEHOLDER = /^\uE000\d+\uE001/;
+  function createUnicodePunctuationPattern() {
+    try {
+      return new RegExp("^[\\p{P}\\p{S}]$", "u");
+    } catch (e) {
+      return BMP_PUNCTUATION;
+    }
+  }
+  var UNICODE_PUNCTUATION = createUnicodePunctuationPattern();
+  function isPunctuation(character) {
+    return character !== null && (ASCII_PUNCTUATION.test(character) || UNICODE_PUNCTUATION.test(character));
+  }
+  function characterAt(text, index, htmlEntities) {
+    if (index >= text.length)
+      return [null, 0];
+    if (text[index] === "\uE000") {
+      const placeholder = PLACEHOLDER.exec(text.slice(index));
+      if (placeholder)
+        return ["`", placeholder[0].length];
+    }
+    if (htmlEntities && text[index] === "&") {
+      const match = ENTITY2.exec(text.slice(index, index + 6));
+      if (match)
+        return [DECODED_ENTITY2[match[0]], match[0].length];
+    }
+    const character = String.fromCodePoint(text.codePointAt(index));
+    return [character, character.length];
+  }
+  function isEscaped2(text, index) {
+    let slashes = 0;
+    while (index > 0 && text[--index] === "\\")
+      slashes++;
+    return slashes % 2 === 1;
+  }
+  function skipHtmlTag(text, index) {
+    if (text[index] !== "<")
+      return index;
+    const end = text.indexOf(">", index + 1);
+    return end === -1 ? index : end + 1;
+  }
+  function nextVisibleCharacter(text, index, htmlEntities) {
+    let position = index;
+    while (position < text.length) {
+      const afterTag = skipHtmlTag(text, position);
+      if (afterTag !== position) {
+        position = afterTag;
+        continue;
+      }
+      return characterAt(text, position, htmlEntities)[0];
+    }
+    return "\n";
+  }
+  function delimiterFlags(marker, before, after) {
+    const beforeWhitespace = /\s/u.test(before);
+    const afterWhitespace = /\s/u.test(after);
+    const beforePunctuation = isPunctuation(before);
+    const afterPunctuation = isPunctuation(after);
+    const leftFlanking = !afterWhitespace && (!afterPunctuation || beforeWhitespace || beforePunctuation);
+    const rightFlanking = !beforeWhitespace && (!beforePunctuation || afterWhitespace || afterPunctuation);
+    if (marker === "_") {
+      return {
+        canOpen: leftFlanking && (!rightFlanking || beforePunctuation),
+        canClose: rightFlanking && (!leftFlanking || afterPunctuation)
+      };
+    }
+    return { canOpen: leftFlanking, canClose: rightFlanking };
+  }
+  function scanDelimiters(text, htmlEntities) {
+    const delimiters = [];
+    let previousCharacter = "\n";
+    let index = 0;
+    while (index < text.length) {
+      const afterTag = skipHtmlTag(text, index);
+      if (afterTag !== index) {
+        index = afterTag;
+        continue;
+      }
+      const [character, length] = characterAt(text, index, htmlEntities);
+      if ((character === "*" || character === "_") && !isEscaped2(text, index)) {
+        const start = index;
+        let count = 0;
+        while (text[index] === character && !isEscaped2(text, index)) {
+          count++;
+          index++;
+        }
+        const flags = delimiterFlags(
+          character,
+          previousCharacter,
+          nextVisibleCharacter(text, index, htmlEntities)
+        );
+        const delimiter = {
+          marker: character,
+          start,
+          original: count,
+          remaining: count,
+          usedAsOpener: 0,
+          usedAsCloser: 0,
+          ...flags,
+          previous: delimiters.length > 0 ? delimiters[delimiters.length - 1] : null,
+          next: null
+        };
+        if (delimiter.previous)
+          delimiter.previous.next = delimiter;
+        delimiters.push(delimiter);
+        previousCharacter = character;
+        continue;
+      }
+      previousCharacter = character;
+      index += length;
+    }
+    return delimiters;
+  }
+  function removeDelimiter(state, delimiter) {
+    if (delimiter.previous)
+      delimiter.previous.next = delimiter.next;
+    else
+      state.head = delimiter.next;
+    if (delimiter.next)
+      delimiter.next.previous = delimiter.previous;
+    delimiter.previous = null;
+    delimiter.next = null;
+  }
+  function removeBetween(opener, closer) {
+    let delimiter = opener.next;
+    while (delimiter && delimiter !== closer) {
+      const next = delimiter.next;
+      delimiter.previous = null;
+      delimiter.next = null;
+      delimiter = next;
+    }
+    opener.next = closer;
+    closer.previous = opener;
+  }
+  function findEmphasis(text, { htmlEntities = false } = {}) {
+    var _a;
+    const delimiters = scanDelimiters(text, htmlEntities);
+    const state = { head: (_a = delimiters[0]) != null ? _a : null };
+    const matches = [];
+    let closer = state.head;
+    while (closer) {
+      if (!closer.canClose) {
+        closer = closer.next;
+        continue;
+      }
+      let opener = closer.previous;
+      while (opener) {
+        const oddMatch = (closer.canOpen || opener.canClose) && (opener.original % 3 !== 0 || closer.original % 3 !== 0) && (opener.original + closer.original) % 3 === 0;
+        if (opener.marker === closer.marker && opener.canOpen && !oddMatch)
+          break;
+        opener = opener.previous;
+      }
+      if (!opener) {
+        const next2 = closer.next;
+        if (!closer.canOpen)
+          removeDelimiter(state, closer);
+        closer = next2;
+        continue;
+      }
+      const use = opener.remaining >= 2 && closer.remaining >= 2 ? 2 : 1;
+      const openStart = opener.start + opener.original - opener.usedAsOpener - use;
+      const closeStart = closer.start + closer.usedAsCloser;
+      matches.push({
+        type: use === 2 ? "strong" : "em",
+        openStart,
+        openEnd: openStart + use,
+        closeStart,
+        closeEnd: closeStart + use
+      });
+      opener.remaining -= use;
+      closer.remaining -= use;
+      opener.usedAsOpener += use;
+      closer.usedAsCloser += use;
+      removeBetween(opener, closer);
+      const next = closer.next;
+      if (opener.remaining === 0)
+        removeDelimiter(state, opener);
+      if (closer.remaining === 0) {
+        removeDelimiter(state, closer);
+        closer = next;
+      }
+    }
+    return matches.sort((a, b) => a.openStart - b.openStart || b.closeEnd - a.closeEnd);
+  }
+  function renderEmphasis(text, options = {}) {
+    const { includeEm = true, includeStrong = true } = options;
+    const matches = findEmphasis(text, options).filter(
+      (match) => match.type === "em" ? includeEm : includeStrong
+    );
+    if (matches.length === 0)
+      return text;
+    const boundaries = /* @__PURE__ */ new Map();
+    const at = (position) => {
+      if (!boundaries.has(position)) {
+        boundaries.set(position, { openEnd: [], closeEnd: [], openStart: [], closeStart: [] });
+      }
+      return boundaries.get(position);
+    };
+    for (const match of matches) {
+      const tag = match.type;
+      at(match.openStart).openStart.push(`<${tag}><span class="syntax-marker">`);
+      at(match.openEnd).openEnd.push("</span>");
+      at(match.closeStart).closeStart.push('<span class="syntax-marker">');
+      at(match.closeEnd).closeEnd.push(`</span></${tag}>`);
+    }
+    let result = "";
+    let previous = 0;
+    for (const position of [...boundaries.keys()].sort((a, b) => a - b)) {
+      result += text.slice(previous, position);
+      const events = boundaries.get(position);
+      result += events.openEnd.join("");
+      result += events.closeEnd.join("");
+      result += events.openStart.join("");
+      result += events.closeStart.join("");
+      previous = position;
+    }
+    return result + text.slice(previous);
+  }
+
   // src/parser.js
+  function decodeEscapedLine(html) {
+    return html.replace(/&nbsp;/g, " ").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+  }
   var MarkdownParser = class {
     /**
      * Reset link index (call before parsing a new document)
@@ -100,11 +801,14 @@ var OverTypeEditor = (() => {
      * @returns {string} Parsed HTML with header styling
      */
     static parseHeader(html) {
-      return html.replace(/^(#{1,3})\s(.+)$/, (match, hashes, content) => {
-        const level = hashes.length;
-        content = this.parseInlineElements(content);
-        return `<h${level}><span class="syntax-marker">${hashes} </span>${content}</h${level}>`;
-      });
+      const heading = scanAtxHeading(decodeEscapedLine(html));
+      if (!heading)
+        return html;
+      const indent = heading.indent.replace(/ /g, "&nbsp;");
+      const opening = this.escapeHtml(heading.marker + heading.separator);
+      const content = this.parseInlineElements(this.escapeHtml(heading.content));
+      const closing = heading.closing ? `<span class="syntax-marker">${this.escapeHtml(heading.closing)}</span>` : "";
+      return `<h${heading.level}>${indent}<span class="syntax-marker">${opening}</span>${content}${closing}</h${heading.level}>`;
     }
     /**
      * Parse horizontal rules
@@ -112,10 +816,11 @@ var OverTypeEditor = (() => {
      * @returns {string|null} Parsed horizontal rule or null
      */
     static parseHorizontalRule(html) {
-      if (html.match(/^(-{3,}|\*{3,}|_{3,})$/)) {
-        return `<div><span class="hr-marker">${html}</span></div>`;
-      }
-      return null;
+      const source = decodeEscapedLine(html);
+      if (!scanThematicBreak(source))
+        return null;
+      const rendered = this.preserveIndentation(this.escapeHtml(source), source);
+      return `<div><span class="hr-marker">${rendered}</span></div>`;
     }
     /**
      * Parse blockquotes
@@ -123,9 +828,14 @@ var OverTypeEditor = (() => {
      * @returns {string} Parsed blockquote
      */
     static parseBlockquote(html) {
-      return html.replace(/^&gt; (.+)$/, (match, content) => {
-        return `<span class="blockquote"><span class="syntax-marker">&gt;</span> ${content}</span>`;
-      });
+      const blockquote = scanBlockquote(decodeEscapedLine(html));
+      if (!blockquote)
+        return html;
+      const indent = blockquote.indent.replace(/ /g, "&nbsp;");
+      const marker = this.escapeHtml(blockquote.marker);
+      const separator = this.escapeHtml(blockquote.separator);
+      const content = this.parseInlineElements(this.escapeHtml(blockquote.content));
+      return `${indent}<span class="blockquote"><span class="syntax-marker">${marker}</span>${separator}${content}</span>`;
     }
     /**
      * Parse bullet lists
@@ -133,10 +843,16 @@ var OverTypeEditor = (() => {
      * @returns {string} Parsed bullet list item
      */
     static parseBulletList(html) {
-      return html.replace(/^((?:&nbsp;)*)([-*+])\s(.+)$/, (match, indent, marker, content) => {
-        content = this.parseInlineElements(content);
-        return `${indent}<li class="bullet-list"><span class="syntax-marker">${marker} </span>${content}</li>`;
-      });
+      const source = decodeEscapedLine(html);
+      if (scanThematicBreak(source))
+        return html;
+      const listItem = scanListItem(source);
+      if (!listItem || listItem.listType !== "bullet")
+        return html;
+      const indent = listItem.indent.replace(/ /g, "&nbsp;");
+      const marker = this.escapeHtml(listItem.marker + listItem.separator);
+      const content = this.parseInlineElements(this.escapeHtml(listItem.content));
+      return `${indent}<li class="bullet-list"><span class="syntax-marker">${marker}</span>${content}</li>`;
     }
     /**
      * Parse task lists (GitHub Flavored Markdown checkboxes)
@@ -146,12 +862,14 @@ var OverTypeEditor = (() => {
      */
     static parseTaskList(html, isPreviewMode = false) {
       return html.replace(/^((?:&nbsp;)*)-(\s+)\[([ xX])\](\s*)(.*)$/, (match, indent, spacingBeforeBox, checked, spacingAfterBox, content) => {
+        if (spacingAfterBox === "" && content !== "")
+          return match;
         content = this.parseInlineElements(content);
         if (isPreviewMode) {
           const isChecked = checked.toLowerCase() === "x";
-          return `${indent}<li class="task-list"><input type="checkbox" ${isChecked ? "checked" : ""}> ${content}</li>`;
+          return `<li class="task-list">${indent}<input type="checkbox" ${isChecked ? "checked" : ""}> ${content}</li>`;
         } else {
-          return `${indent}<li class="task-list"><span class="syntax-marker">-${spacingBeforeBox}[${checked}]${spacingAfterBox}</span>${content}</li>`;
+          return `<li class="task-list">${indent}<span class="syntax-marker">-${spacingBeforeBox}[${checked}]${spacingAfterBox}</span>${content}</li>`;
         }
       });
     }
@@ -161,10 +879,13 @@ var OverTypeEditor = (() => {
      * @returns {string} Parsed numbered list item
      */
     static parseNumberedList(html) {
-      return html.replace(/^((?:&nbsp;)*)(\d+\.)\s(.+)$/, (match, indent, marker, content) => {
-        content = this.parseInlineElements(content);
-        return `${indent}<li class="ordered-list"><span class="syntax-marker">${marker} </span>${content}</li>`;
-      });
+      const listItem = scanListItem(decodeEscapedLine(html));
+      if (!listItem || listItem.listType !== "ordered")
+        return html;
+      const indent = listItem.indent.replace(/ /g, "&nbsp;");
+      const marker = this.escapeHtml(listItem.marker + listItem.separator);
+      const content = this.parseInlineElements(this.escapeHtml(listItem.content));
+      return `${indent}<li class="ordered-list"><span class="syntax-marker">${marker}</span>${content}</li>`;
     }
     /**
      * Parse code blocks (markers only)
@@ -172,11 +893,61 @@ var OverTypeEditor = (() => {
      * @returns {string|null} Parsed code fence or null
      */
     static parseCodeBlock(html) {
-      const codeFenceRegex = /^`{3}[^`]*$/;
-      if (codeFenceRegex.test(html)) {
-        return `<div><span class="code-fence">${html}</span></div>`;
+      const descriptor = scanFenceOpen(decodeEscapedLine(html));
+      return descriptor ? this.renderFence(descriptor) : null;
+    }
+    static renderFence(descriptor, raw = false) {
+      const source = this.preserveIndentation(this.escapeHtml(descriptor.source), descriptor.source);
+      const className = raw ? ' class="raw-line"' : "";
+      return `<div${className}><span class="code-fence">${source}</span></div>`;
+    }
+    static renderCodeContent(lines, info, instanceHighlighter, indentation = 0, rawLineIndex = -1) {
+      const semanticLines = lines.map((line) => {
+        let width = 0;
+        while (width < indentation && line[width] === " ")
+          width++;
+        return { source: line, prefix: line.slice(0, width), content: line.slice(width) };
+      });
+      const semanticContent = semanticLines.map((line) => line.content).join("\n");
+      const renderPrefix = (prefix) => prefix ? `<span class="syntax-marker">${this.escapeHtml(prefix)}</span>` : "";
+      const displayContent = semanticLines.map((line, index) => {
+        if (index === rawLineIndex) {
+          return `<span class="raw-line">${this.escapeHtml(line.source) || "&nbsp;"}</span>`;
+        }
+        if (line.prefix === "" && line.content === "")
+          return '<span class="syntax-marker">&nbsp;</span>';
+        return renderPrefix(line.prefix) + this.escapeHtml(line.content);
+      }).join("\n");
+      const language = info.split(/[\t ]/, 1)[0];
+      const languageClass = language ? ` class="language-${this.escapeHtml(language)}"` : "";
+      const highlighter = instanceHighlighter || this.codeHighlighter;
+      let content = displayContent;
+      if (highlighter) {
+        try {
+          const result = highlighter(semanticContent, language);
+          if (result && typeof result.then === "function") {
+            console.warn("Async highlighters are not supported in parse() because it returns an HTML string. Use synchronous highlighters only.");
+          } else if (result && typeof result === "string" && result.trim()) {
+            const highlightedLines = result.split("\n");
+            if (highlightedLines.length === semanticLines.length + 1 && highlightedLines[highlightedLines.length - 1] === "") {
+              highlightedLines.pop();
+            }
+            if (highlightedLines.length === semanticLines.length) {
+              content = highlightedLines.map((line, index) => {
+                if (index === rawLineIndex) {
+                  return `<span class="raw-line">${this.escapeHtml(semanticLines[index].source) || "&nbsp;"}</span>`;
+                }
+                return renderPrefix(semanticLines[index].prefix) + line;
+              }).join("\n");
+            } else {
+              console.warn("Code highlighter output line count does not match the source. Using unhighlighted code to preserve alignment.");
+            }
+          }
+        } catch (error) {
+          console.warn("Code highlighting failed:", error);
+        }
       }
-      return null;
+      return `<pre class="code-block"><code${languageClass}>${content}</code></pre>`;
     }
     /**
      * Parse bold text
@@ -184,20 +955,18 @@ var OverTypeEditor = (() => {
      * @returns {string} HTML with bold styling
      */
     static parseBold(html) {
-      html = html.replace(/\*\*(.+?)\*\*/g, '<strong><span class="syntax-marker">**</span>$1<span class="syntax-marker">**</span></strong>');
-      html = html.replace(/__(.+?)__/g, '<strong><span class="syntax-marker">__</span>$1<span class="syntax-marker">__</span></strong>');
-      return html;
+      return renderEmphasis(html, { htmlEntities: true, includeEm: false });
     }
     /**
      * Parse italic text
-     * Note: Uses lookbehind assertions - requires modern browsers
      * @param {string} html - HTML with potential italic markdown
      * @returns {string} HTML with italic styling
      */
     static parseItalic(html) {
-      html = html.replace(new RegExp("(?<![\\*>])\\*(?!\\*)(.+?)(?<!\\*)\\*(?!\\*)", "g"), '<em><span class="syntax-marker">*</span>$1<span class="syntax-marker">*</span></em>');
-      html = html.replace(new RegExp("(?<=^|\\s)_(?!_)(.+?)(?<!_)_(?!_)(?=\\s|$)", "g"), '<em><span class="syntax-marker">_</span>$1<span class="syntax-marker">_</span></em>');
-      return html;
+      return renderEmphasis(html, { htmlEntities: true, includeStrong: false });
+    }
+    static parseEmphasis(html) {
+      return renderEmphasis(html, { htmlEntities: true });
     }
     /**
      * Parse strikethrough text
@@ -216,7 +985,12 @@ var OverTypeEditor = (() => {
      * @returns {string} HTML with code styling
      */
     static parseInlineCode(html) {
-      return html.replace(new RegExp("(?<!`)(`+)(?!`)((?:(?!\\1).)+?)(\\1)(?!`)", "g"), '<code><span class="syntax-marker">$1</span>$2<span class="syntax-marker">$3</span></code>');
+      const spans = findCodeSpans(html);
+      for (const span of spans.reverse()) {
+        const replacement = `<code><span class="syntax-marker">${span.openTicks}</span>${span.content}<span class="syntax-marker">${span.closeTicks}</span></code>`;
+        html = html.slice(0, span.start) + replacement + html.slice(span.end);
+      }
+      return html;
     }
     /**
      * Sanitize URL to prevent XSS attacks
@@ -240,17 +1014,37 @@ var OverTypeEditor = (() => {
       }
       return "#";
     }
+    static findLinks(text, options = {}) {
+      const { allowEmptyText = false, ...scannerOptions } = options;
+      return findLinks(text, scannerOptions).filter(
+        (link) => (allowEmptyText || link.text.raw.length > 0) && link.destination !== null && link.destination.value.length > 0
+      );
+    }
+    static findRenderableLinks(text, options = {}) {
+      const { allowEmptyText = false, ...scannerOptions } = options;
+      return findRenderableLinks(text, scannerOptions).filter(
+        (link) => (allowEmptyText || link.text.raw.length > 0) && link.destination !== null && link.destination.value.length > 0
+      );
+    }
     /**
      * Parse links
      * @param {string} html - HTML with potential link markdown
      * @returns {string} HTML with link styling
      */
     static parseLinks(html) {
-      return html.replace(/\[(.+?)\]\((.+?)\)/g, (match, text, url) => {
-        const anchorName = `--link-${this.linkIndex++}`;
-        const safeUrl = this.sanitizeUrl(url);
-        return `<a href="${safeUrl}" style="anchor-name: ${anchorName}"><span class="syntax-marker">[</span>${text}<span class="syntax-marker url-part">](${url})</span></a>`;
+      const links = this.findLinks(html, { htmlEntities: true });
+      links.forEach((link) => {
+        link.anchorName = `--link-${this.linkIndex++}`;
       });
+      for (const link of links.reverse()) {
+        const safeUrl = this.escapeHtml(this.sanitizeUrl(link.destination.value));
+        const title = link.title === null ? "" : ` title="${this.escapeHtml(link.title.value)}"`;
+        const linkText = html.slice(link.text.start, link.text.end);
+        const tail = html.slice(link.text.end, link.end);
+        const replacement = `<a href="${safeUrl}"${title} style="anchor-name: ${link.anchorName}"><span class="syntax-marker">[</span>${linkText}<span class="syntax-marker url-part">${tail}</span></a>`;
+        html = html.slice(0, link.start) + replacement + html.slice(link.end);
+      }
+      return html;
     }
     /**
      * Identify and protect sanctuaries (code and links) before parsing
@@ -261,55 +1055,38 @@ var OverTypeEditor = (() => {
       const sanctuaries = /* @__PURE__ */ new Map();
       let sanctuaryCounter = 0;
       let protectedText = text;
-      const protectedRegions = [];
-      const linkRegex = /\[([^\]]+)\]\(([^)]+)\)/g;
-      let linkMatch;
-      while ((linkMatch = linkRegex.exec(text)) !== null) {
-        const bracketPos = linkMatch.index + linkMatch[0].indexOf("](");
-        const urlStart = bracketPos + 2;
-        const urlEnd = urlStart + linkMatch[2].length;
-        protectedRegions.push({ start: urlStart, end: urlEnd });
-      }
-      const codeRegex = new RegExp("(?<!`)(`+)(?!`)((?:(?!\\1).)+?)(\\1)(?!`)", "g");
-      let codeMatch;
-      const codeMatches = [];
-      while ((codeMatch = codeRegex.exec(text)) !== null) {
-        const codeStart = codeMatch.index;
-        const codeEnd = codeMatch.index + codeMatch[0].length;
-        const inProtectedRegion = protectedRegions.some(
-          (region) => codeStart >= region.start && codeEnd <= region.end
-        );
-        if (!inProtectedRegion) {
-          codeMatches.push({
-            match: codeMatch[0],
-            index: codeMatch.index,
-            openTicks: codeMatch[1],
-            content: codeMatch[2],
-            closeTicks: codeMatch[3]
-          });
-        }
-      }
-      codeMatches.sort((a, b) => b.index - a.index);
+      const links = text.includes("[") ? this.findRenderableLinks(text, { htmlEntities: true }) : [];
+      const protectedRegions = links.map((link) => ({ start: link.text.end, end: link.end }));
+      const codeMatches = findCodeSpans(text, protectedRegions);
+      codeMatches.sort((a, b) => b.start - a.start);
       codeMatches.forEach((codeInfo) => {
         const placeholder = `\uE000${sanctuaryCounter++}\uE001`;
         sanctuaries.set(placeholder, {
           type: "code",
-          original: codeInfo.match,
+          original: codeInfo.raw,
           openTicks: codeInfo.openTicks,
           content: codeInfo.content,
           closeTicks: codeInfo.closeTicks
         });
-        protectedText = protectedText.substring(0, codeInfo.index) + placeholder + protectedText.substring(codeInfo.index + codeInfo.match.length);
+        protectedText = protectedText.substring(0, codeInfo.start) + placeholder + protectedText.substring(codeInfo.end);
       });
-      protectedText = protectedText.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, linkText, url) => {
+      const codePlaceholders = [...sanctuaries.keys()];
+      const protectedLinks = (protectedText.includes("[") ? this.findLinks(protectedText, { htmlEntities: true }) : []).filter((link) => {
+        const tail = protectedText.slice(link.text.end, link.end);
+        return codePlaceholders.every((placeholder) => !tail.includes(placeholder));
+      });
+      protectedLinks.sort((a, b) => b.start - a.start).forEach((link) => {
+        var _a, _b;
         const placeholder = `\uE000${sanctuaryCounter++}\uE001`;
         sanctuaries.set(placeholder, {
           type: "link",
-          original: match,
-          linkText,
-          url
+          original: protectedText.slice(link.start, link.end),
+          linkText: protectedText.slice(link.text.start, link.text.end),
+          tail: protectedText.slice(link.text.end, link.end),
+          url: link.destination.value,
+          title: (_b = (_a = link.title) == null ? void 0 : _a.value) != null ? _b : null
         });
-        return placeholder;
+        protectedText = protectedText.slice(0, link.start) + placeholder + protectedText.slice(link.end);
       });
       return { protectedText, sanctuaries };
     }
@@ -332,22 +1109,20 @@ var OverTypeEditor = (() => {
           replacement = `<code><span class="syntax-marker">${sanctuary.openTicks}</span>${sanctuary.content}<span class="syntax-marker">${sanctuary.closeTicks}</span></code>`;
         } else if (sanctuary.type === "link") {
           let processedLinkText = sanctuary.linkText;
+          processedLinkText = this.parseStrikethrough(processedLinkText);
+          processedLinkText = this.parseEmphasis(processedLinkText);
           sanctuaries.forEach((innerSanctuary, innerPlaceholder) => {
-            if (processedLinkText.includes(innerPlaceholder)) {
-              if (innerSanctuary.type === "code") {
-                const codeHtml = `<code><span class="syntax-marker">${innerSanctuary.openTicks}</span>${innerSanctuary.content}<span class="syntax-marker">${innerSanctuary.closeTicks}</span></code>`;
-                processedLinkText = processedLinkText.replace(innerPlaceholder, codeHtml);
-              }
+            if (processedLinkText.includes(innerPlaceholder) && innerSanctuary.type === "code") {
+              const codeHtml = `<code><span class="syntax-marker">${innerSanctuary.openTicks}</span>${innerSanctuary.content}<span class="syntax-marker">${innerSanctuary.closeTicks}</span></code>`;
+              processedLinkText = processedLinkText.replace(innerPlaceholder, () => codeHtml);
             }
           });
-          processedLinkText = this.parseStrikethrough(processedLinkText);
-          processedLinkText = this.parseBold(processedLinkText);
-          processedLinkText = this.parseItalic(processedLinkText);
           const anchorName = `--link-${this.linkIndex++}`;
-          const safeUrl = this.sanitizeUrl(sanctuary.url);
-          replacement = `<a href="${safeUrl}" style="anchor-name: ${anchorName}"><span class="syntax-marker">[</span>${processedLinkText}<span class="syntax-marker url-part">](${sanctuary.url})</span></a>`;
+          const safeUrl = this.escapeHtml(this.sanitizeUrl(sanctuary.url));
+          const title = sanctuary.title === null ? "" : ` title="${this.escapeHtml(sanctuary.title)}"`;
+          replacement = `<a href="${safeUrl}"${title} style="anchor-name: ${anchorName}"><span class="syntax-marker">[</span>${processedLinkText}<span class="syntax-marker url-part">${sanctuary.tail}</span></a>`;
         }
-        html = html.replace(placeholder, replacement);
+        html = html.replace(placeholder, () => replacement);
       });
       return html;
     }
@@ -360,8 +1135,7 @@ var OverTypeEditor = (() => {
       const { protectedText, sanctuaries } = this.identifyAndProtectSanctuaries(text);
       let html = protectedText;
       html = this.parseStrikethrough(html);
-      html = this.parseBold(html);
-      html = this.parseItalic(html);
+      html = this.parseEmphasis(html);
       html = this.restoreAndTransformSanctuaries(html, sanctuaries);
       return html;
     }
@@ -371,25 +1145,47 @@ var OverTypeEditor = (() => {
      * @returns {string} Parsed HTML line
      */
     static parseLine(line, isPreviewMode = false) {
-      let html = this.escapeHtml(line);
-      html = this.preserveIndentation(html, line);
-      const horizontalRule = this.parseHorizontalRule(html);
-      if (horizontalRule)
-        return horizontalRule;
-      const codeBlock = this.parseCodeBlock(html);
-      if (codeBlock)
-        return codeBlock;
-      html = this.parseHeader(html);
-      html = this.parseBlockquote(html);
-      html = this.parseTaskList(html, isPreviewMode);
-      html = this.parseBulletList(html);
-      html = this.parseNumberedList(html);
-      if (!html.includes("<li") && !html.includes("<h")) {
-        html = this.parseInlineElements(html);
-      }
-      if (html.trim() === "") {
+      if (line === "")
         return "<div>&nbsp;</div>";
+      const thematicBreak = scanThematicBreak(line);
+      if (thematicBreak) {
+        const source = this.preserveIndentation(this.escapeHtml(line), line);
+        return `<div><span class="hr-marker">${source}</span></div>`;
       }
+      const fence = scanFenceOpen(line);
+      if (fence)
+        return this.renderFence(fence);
+      const heading = scanAtxHeading(line);
+      if (heading) {
+        const indent = heading.indent.replace(/ /g, "&nbsp;");
+        const opening = this.escapeHtml(heading.marker + heading.separator);
+        const content = this.parseInlineElements(this.escapeHtml(heading.content));
+        const closing = heading.closing ? `<span class="syntax-marker">${this.escapeHtml(heading.closing)}</span>` : "";
+        return `<div><h${heading.level}>${indent}<span class="syntax-marker">${opening}</span>${content}${closing}</h${heading.level}></div>`;
+      }
+      const blockquote = scanBlockquote(line);
+      if (blockquote) {
+        const indent = blockquote.indent.replace(/ /g, "&nbsp;");
+        const marker = this.escapeHtml(blockquote.marker);
+        const separator = this.escapeHtml(blockquote.separator);
+        const content = this.parseInlineElements(this.escapeHtml(blockquote.content));
+        return `<div>${indent}<span class="blockquote"><span class="syntax-marker">${marker}</span>${separator}${content}</span></div>`;
+      }
+      let html = this.preserveIndentation(this.escapeHtml(line), line);
+      const taskList = this.parseTaskList(html, isPreviewMode);
+      if (taskList !== html)
+        return `<div>${taskList}</div>`;
+      const listItem = scanListItem(line);
+      if (listItem) {
+        const indent = listItem.indent.replace(/ /g, "&nbsp;");
+        const marker = this.escapeHtml(listItem.marker + listItem.separator);
+        const content = this.parseInlineElements(this.escapeHtml(listItem.content));
+        const className = listItem.listType === "bullet" ? "bullet-list" : "ordered-list";
+        return `<div>${indent}<li class="${className}"><span class="syntax-marker">${marker}</span>${content}</li></div>`;
+      }
+      const leadingWhitespace = /^[\t ]*/.exec(line)[0];
+      const indentation = leadingWhitespace.replace(/ /g, "&nbsp;");
+      html = indentation + this.parseInlineElements(this.escapeHtml(line.slice(leadingWhitespace.length)));
       return `<div>${html}</div>`;
     }
     /**
@@ -403,26 +1199,48 @@ var OverTypeEditor = (() => {
     static parse(text, activeLine = -1, showActiveLineRaw = false, instanceHighlighter, isPreviewMode = false) {
       this.resetLinkIndex();
       const lines = text.split("\n");
-      let inCodeBlock = false;
-      const parsedLines = lines.map((line, index) => {
-        if (showActiveLineRaw && index === activeLine) {
+      const parsedLines = [];
+      let opening = null;
+      let codeLines = [];
+      let rawCodeLine = -1;
+      for (let index = 0; index < lines.length; index++) {
+        const line = lines[index];
+        const isRaw = showActiveLineRaw && index === activeLine;
+        if (opening) {
+          const closing = scanFenceClose(line, opening);
+          if (closing) {
+            parsedLines.push(this.renderCodeContent(codeLines, opening.info, instanceHighlighter, opening.indent.length, rawCodeLine));
+            const renderedFence = this.renderFence(closing, isRaw);
+            parsedLines.push(isRaw ? renderedFence : this.applyCustomSyntax(renderedFence));
+            opening = null;
+            codeLines = [];
+            rawCodeLine = -1;
+          } else {
+            if (isRaw)
+              rawCodeLine = codeLines.length;
+            codeLines.push(line);
+          }
+          continue;
+        }
+        const candidate = scanFenceOpen(line);
+        if (candidate) {
+          opening = candidate;
+          const renderedFence = this.renderFence(candidate, isRaw);
+          parsedLines.push(isRaw ? renderedFence : this.applyCustomSyntax(renderedFence));
+          continue;
+        }
+        if (isRaw) {
           const content = this.escapeHtml(line) || "&nbsp;";
-          return `<div class="raw-line">${content}</div>`;
+          parsedLines.push(`<div class="raw-line">${content}</div>`);
+          continue;
         }
-        const codeFenceRegex = /^```[^`]*$/;
-        if (codeFenceRegex.test(line)) {
-          inCodeBlock = !inCodeBlock;
-          return this.applyCustomSyntax(this.parseLine(line, isPreviewMode));
-        }
-        if (inCodeBlock) {
-          const escaped = this.escapeHtml(line);
-          const indented = this.preserveIndentation(escaped, line);
-          return `<div>${indented || "&nbsp;"}</div>`;
-        }
-        return this.applyCustomSyntax(this.parseLine(line, isPreviewMode));
-      });
+        parsedLines.push(this.applyCustomSyntax(this.parseLine(line, isPreviewMode)));
+      }
+      if (opening && codeLines.length > 0) {
+        parsedLines.push(this.renderCodeContent(codeLines, opening.info, instanceHighlighter, opening.indent.length, rawCodeLine));
+      }
       const html = parsedLines.join("");
-      return this.postProcessHTML(html, instanceHighlighter);
+      return this.postProcessHTML(html, instanceHighlighter, false);
     }
     /**
      * Post-process HTML to consolidate lists and code blocks
@@ -430,116 +1248,8 @@ var OverTypeEditor = (() => {
      * @param {Function} instanceHighlighter - Instance-specific code highlighter (optional, overrides global if provided)
      * @returns {string} Post-processed HTML with consolidated lists and code blocks
      */
-    static postProcessHTML(html, instanceHighlighter) {
-      if (typeof document === "undefined" || !document) {
-        return this.postProcessHTMLManual(html, instanceHighlighter);
-      }
-      const container = document.createElement("div");
-      container.innerHTML = html;
-      let currentList = null;
-      let listType = null;
-      let currentCodeBlock = null;
-      let inCodeBlock = false;
-      const children = Array.from(container.children);
-      for (let i = 0; i < children.length; i++) {
-        const child = children[i];
-        if (!child.parentNode)
-          continue;
-        const codeFence = child.querySelector(".code-fence");
-        if (codeFence) {
-          const fenceText = codeFence.textContent;
-          if (fenceText.startsWith("```")) {
-            if (!inCodeBlock) {
-              inCodeBlock = true;
-              currentCodeBlock = document.createElement("pre");
-              const codeElement = document.createElement("code");
-              currentCodeBlock.appendChild(codeElement);
-              currentCodeBlock.className = "code-block";
-              const lang = fenceText.slice(3).trim();
-              if (lang) {
-                codeElement.className = `language-${lang}`;
-              }
-              container.insertBefore(currentCodeBlock, child.nextSibling);
-              currentCodeBlock._codeElement = codeElement;
-              currentCodeBlock._language = lang;
-              currentCodeBlock._codeContent = "";
-              continue;
-            } else {
-              const highlighter = instanceHighlighter || this.codeHighlighter;
-              if (currentCodeBlock && highlighter && currentCodeBlock._codeContent) {
-                try {
-                  const result = highlighter(
-                    currentCodeBlock._codeContent,
-                    currentCodeBlock._language || ""
-                  );
-                  if (result && typeof result.then === "function") {
-                    console.warn("Async highlighters are not supported in parse() because it returns an HTML string. The caller creates new DOM elements from that string, breaking references to the elements we would update. Use synchronous highlighters only.");
-                  } else {
-                    if (result && typeof result === "string" && result.trim()) {
-                      currentCodeBlock._codeElement.innerHTML = result;
-                    }
-                  }
-                } catch (error) {
-                  console.warn("Code highlighting failed:", error);
-                }
-              }
-              inCodeBlock = false;
-              currentCodeBlock = null;
-              continue;
-            }
-          }
-        }
-        if (inCodeBlock && currentCodeBlock && child.tagName === "DIV" && !child.querySelector(".code-fence")) {
-          const codeElement = currentCodeBlock._codeElement || currentCodeBlock.querySelector("code");
-          if (currentCodeBlock._codeContent.length > 0) {
-            currentCodeBlock._codeContent += "\n";
-          }
-          const lineText = child.textContent.replace(/\u00A0/g, " ");
-          currentCodeBlock._codeContent += lineText;
-          if (codeElement.textContent.length > 0) {
-            codeElement.textContent += "\n";
-          }
-          codeElement.textContent += lineText;
-          child.remove();
-          continue;
-        }
-        let listItem = null;
-        if (child.tagName === "DIV") {
-          listItem = child.querySelector("li");
-        }
-        if (listItem) {
-          const isBullet = listItem.classList.contains("bullet-list");
-          const isOrdered = listItem.classList.contains("ordered-list");
-          if (!isBullet && !isOrdered) {
-            currentList = null;
-            listType = null;
-            continue;
-          }
-          const newType = isBullet ? "ul" : "ol";
-          if (!currentList || listType !== newType) {
-            currentList = document.createElement(newType);
-            container.insertBefore(currentList, child);
-            listType = newType;
-          }
-          const indentationNodes = [];
-          for (const node of child.childNodes) {
-            if (node.nodeType === 3 && node.textContent.match(/^\u00A0+$/)) {
-              indentationNodes.push(node.cloneNode(true));
-            } else if (node === listItem) {
-              break;
-            }
-          }
-          indentationNodes.forEach((node) => {
-            listItem.insertBefore(node, listItem.firstChild);
-          });
-          currentList.appendChild(listItem);
-          child.remove();
-        } else {
-          currentList = null;
-          listType = null;
-        }
-      }
-      return container.innerHTML;
+    static postProcessHTML(html, instanceHighlighter, processCodeBlocks = true) {
+      return this.postProcessHTMLManual(html, instanceHighlighter, processCodeBlocks);
     }
     /**
      * Manual post-processing for Node.js environments (without DOM)
@@ -547,13 +1257,13 @@ var OverTypeEditor = (() => {
      * @param {Function} instanceHighlighter - Instance-specific code highlighter (optional, overrides global if provided)
      * @returns {string} Post-processed HTML
      */
-    static postProcessHTMLManual(html, instanceHighlighter) {
+    static postProcessHTMLManual(html, instanceHighlighter, processCodeBlocks = true) {
       let processed = html;
-      processed = processed.replace(/((?:<div>(?:&nbsp;)*<li class="bullet-list">.*?<\/li><\/div>\s*)+)/gs, (match) => {
-        const divs = match.match(/<div>(?:&nbsp;)*<li class="bullet-list">.*?<\/li><\/div>/gs) || [];
+      processed = processed.replace(/((?:<div(?:\s[^>]*)?>(?:&nbsp;)*<li class="bullet-list">.*?<\/li><\/div>\s*)+)/gs, (match) => {
+        const divs = match.match(/<div(?:\s[^>]*)?>(?:&nbsp;)*<li class="bullet-list">.*?<\/li><\/div>/gs) || [];
         if (divs.length > 0) {
           const items = divs.map((div) => {
-            const indentMatch = div.match(/<div>((?:&nbsp;)*)<li/);
+            const indentMatch = div.match(/<div(?:\s[^>]*)?>((?:&nbsp;)*)<li/);
             const listItemMatch = div.match(/<li class="bullet-list">.*?<\/li>/);
             if (indentMatch && listItemMatch) {
               const indentation = indentMatch[1];
@@ -566,11 +1276,11 @@ var OverTypeEditor = (() => {
         }
         return match;
       });
-      processed = processed.replace(/((?:<div>(?:&nbsp;)*<li class="ordered-list">.*?<\/li><\/div>\s*)+)/gs, (match) => {
-        const divs = match.match(/<div>(?:&nbsp;)*<li class="ordered-list">.*?<\/li><\/div>/gs) || [];
+      processed = processed.replace(/((?:<div(?:\s[^>]*)?>(?:&nbsp;)*<li class="ordered-list">.*?<\/li><\/div>\s*)+)/gs, (match) => {
+        const divs = match.match(/<div(?:\s[^>]*)?>(?:&nbsp;)*<li class="ordered-list">.*?<\/li><\/div>/gs) || [];
         if (divs.length > 0) {
           const items = divs.map((div) => {
-            const indentMatch = div.match(/<div>((?:&nbsp;)*)<li/);
+            const indentMatch = div.match(/<div(?:\s[^>]*)?>((?:&nbsp;)*)<li/);
             const listItemMatch = div.match(/<li class="ordered-list">.*?<\/li>/);
             if (indentMatch && listItemMatch) {
               const indentation = indentMatch[1];
@@ -579,41 +1289,48 @@ var OverTypeEditor = (() => {
             }
             return listItemMatch ? listItemMatch[0] : "";
           }).filter(Boolean);
-          return "<ol>" + items.join("") + "</ol>";
+          const firstMarker = divs[0].match(/<span class="syntax-marker">(\d+)\./);
+          const start = firstMarker ? Number.parseInt(firstMarker[1], 10) : 1;
+          const startAttribute = start === 1 ? "" : ` start="${start}"`;
+          return `<ol${startAttribute}>` + items.join("") + "</ol>";
         }
         return match;
       });
       const codeBlockRegex = /<div><span class="code-fence">(```[^<]*)<\/span><\/div>(.*?)<div><span class="code-fence">(```)<\/span><\/div>/gs;
-      processed = processed.replace(codeBlockRegex, (match, openFence, content, closeFence) => {
-        const lines = content.match(/<div>(.*?)<\/div>/gs) || [];
-        const codeContent = lines.map((line) => {
-          const text = line.replace(/<div>(.*?)<\/div>/s, "$1").replace(/&nbsp;/g, " ");
-          return text;
-        }).join("\n");
-        const lang = openFence.slice(3).trim();
-        const langClass = lang ? ` class="language-${lang}"` : "";
-        let highlightedContent = codeContent;
-        const highlighter = instanceHighlighter || this.codeHighlighter;
-        if (highlighter) {
-          try {
-            const decodedCode = codeContent.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
-            const result2 = highlighter(decodedCode, lang);
-            if (result2 && typeof result2.then === "function") {
-              console.warn("Async highlighters are not supported in Node.js (non-DOM) context. Use synchronous highlighters for server-side rendering.");
-            } else {
-              if (result2 && typeof result2 === "string" && result2.trim()) {
-                highlightedContent = result2;
+      if (processCodeBlocks)
+        processed = processed.replace(codeBlockRegex, (match, openFence, content, closeFence) => {
+          if (content.includes('<pre class="code-block">'))
+            return match;
+          const lines = content.match(/<div>(.*?)<\/div>/gs) || [];
+          const encodedLines = lines.map((line) => line.replace(/<div>(.*?)<\/div>/s, "$1"));
+          const codeContent = encodedLines.map(
+            (line) => line === "&nbsp;" ? "" : line.replace(/&nbsp;/g, " ")
+          ).join("\n");
+          const displayContent = encodedLines.join("\n");
+          const lang = openFence.slice(3).trim();
+          const langClass = lang ? ` class="language-${lang}"` : "";
+          let highlightedContent = displayContent;
+          const highlighter = instanceHighlighter || this.codeHighlighter;
+          if (highlighter) {
+            try {
+              const decodedCode = codeContent.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+              const result2 = highlighter(decodedCode, lang);
+              if (result2 && typeof result2.then === "function") {
+                console.warn("Async highlighters are not supported in Node.js (non-DOM) context. Use synchronous highlighters for server-side rendering.");
+              } else {
+                if (result2 && typeof result2 === "string" && result2.trim()) {
+                  highlightedContent = result2;
+                }
               }
+            } catch (error) {
+              console.warn("Code highlighting failed:", error);
             }
-          } catch (error) {
-            console.warn("Code highlighting failed:", error);
           }
-        }
-        let result = `<div><span class="code-fence">${openFence}</span></div>`;
-        result += `<pre class="code-block"><code${langClass}>${highlightedContent}</code></pre>`;
-        result += `<div><span class="code-fence">${closeFence}</span></div>`;
-        return result;
-      });
+          let result = `<div><span class="code-fence">${openFence}</span></div>`;
+          result += `<pre class="code-block"><code${langClass}>${highlightedContent}</code></pre>`;
+          result += `<div><span class="code-fence">${closeFence}</span></div>`;
+          return result;
+        });
       return processed;
     }
     /**
@@ -638,50 +1355,7 @@ var OverTypeEditor = (() => {
       }
       const currentLine = lines[lineIndex];
       const lineEnd = lineStart + currentLine.length;
-      const checkboxMatch = currentLine.match(this.LIST_PATTERNS.checkbox);
-      if (checkboxMatch) {
-        return {
-          inList: true,
-          listType: "checkbox",
-          indent: checkboxMatch[1],
-          marker: "-",
-          checked: checkboxMatch[2] === "x",
-          content: checkboxMatch[3],
-          lineStart,
-          lineEnd,
-          markerEndPos: lineStart + checkboxMatch[1].length + checkboxMatch[2].length + 5
-          // indent + "- [ ] "
-        };
-      }
-      const bulletMatch = currentLine.match(this.LIST_PATTERNS.bullet);
-      if (bulletMatch) {
-        return {
-          inList: true,
-          listType: "bullet",
-          indent: bulletMatch[1],
-          marker: bulletMatch[2],
-          content: bulletMatch[3],
-          lineStart,
-          lineEnd,
-          markerEndPos: lineStart + bulletMatch[1].length + bulletMatch[2].length + 1
-          // indent + marker + space
-        };
-      }
-      const numberedMatch = currentLine.match(this.LIST_PATTERNS.numbered);
-      if (numberedMatch) {
-        return {
-          inList: true,
-          listType: "numbered",
-          indent: numberedMatch[1],
-          marker: parseInt(numberedMatch[2]),
-          content: numberedMatch[3],
-          lineStart,
-          lineEnd,
-          markerEndPos: lineStart + numberedMatch[1].length + numberedMatch[2].length + 2
-          // indent + number + ". "
-        };
-      }
-      return {
+      const plainContext = {
         inList: false,
         listType: null,
         indent: "",
@@ -690,6 +1364,47 @@ var OverTypeEditor = (() => {
         lineStart,
         lineEnd,
         markerEndPos: lineStart
+      };
+      if (scanThematicBreak(currentLine))
+        return plainContext;
+      const listItem = scanListItem(currentLine);
+      if (!listItem)
+        return plainContext;
+      const checkboxMatch = listItem.listType === "bullet" && listItem.marker === "-" ? /^\[([ xX])\]([\t ]*)(.*)$/.exec(listItem.content) : null;
+      if (checkboxMatch && (checkboxMatch[2] !== "" || checkboxMatch[3] === "")) {
+        return {
+          inList: true,
+          listType: "checkbox",
+          indent: listItem.indent,
+          marker: "-",
+          checked: checkboxMatch[1].toLowerCase() === "x",
+          content: checkboxMatch[3],
+          lineStart,
+          lineEnd,
+          markerEndPos: lineStart + listItem.indent.length + listItem.marker.length + listItem.separator.length + 3 + checkboxMatch[2].length
+        };
+      }
+      if (listItem.listType === "bullet") {
+        return {
+          inList: true,
+          listType: "bullet",
+          indent: listItem.indent,
+          marker: listItem.marker,
+          content: listItem.content,
+          lineStart,
+          lineEnd,
+          markerEndPos: lineStart + listItem.indent.length + listItem.marker.length + listItem.separator.length
+        };
+      }
+      return {
+        inList: true,
+        listType: "numbered",
+        indent: listItem.indent,
+        marker: Number.parseInt(listItem.marker, 10),
+        content: listItem.content,
+        lineStart,
+        lineEnd,
+        markerEndPos: lineStart + listItem.indent.length + listItem.marker.length + listItem.separator.length
       };
     }
     /**
@@ -757,9 +1472,9 @@ var OverTypeEditor = (() => {
    * List pattern definitions
    */
   __publicField(MarkdownParser, "LIST_PATTERNS", {
-    bullet: /^(\s*)([-*+])\s+(.*)$/,
-    numbered: /^(\s*)(\d+)\.\s+(.*)$/,
-    checkbox: /^(\s*)-\s+\[([ x])\]\s+(.*)$/
+    bullet: /^( *)([-*+])[\t ]+(.*)$/,
+    numbered: /^( *)(\d{1,9})\.[\t ]+(.*)$/,
+    checkbox: /^( *)-[\t ]+\[([ xX])\][\t ]+(.*)$/
   });
 
   // src/shortcuts.js
@@ -1035,13 +1750,19 @@ var OverTypeEditor = (() => {
   }
 
   // src/styles.js
+  var styleDefaults = {
+    fontSize: "14px",
+    lineHeight: 1.6,
+    /* System-first, guaranteed monospaced; avoids Android 'ui-monospace' pitfalls */
+    fontFamily: '"SF Mono", SFMono-Regular, Menlo, Monaco, "Cascadia Code", Consolas, "Roboto Mono", "Noto Sans Mono", "Droid Sans Mono", "Ubuntu Mono", "DejaVu Sans Mono", "Liberation Mono", "Courier New", Courier, monospace',
+    padding: "20px"
+  };
   function generateStyles(options = {}) {
     const {
-      fontSize = "14px",
-      lineHeight = 1.6,
-      /* System-first, guaranteed monospaced; avoids Android 'ui-monospace' pitfalls */
-      fontFamily = '"SF Mono", SFMono-Regular, Menlo, Monaco, "Cascadia Code", Consolas, "Roboto Mono", "Noto Sans Mono", "Droid Sans Mono", "Ubuntu Mono", "DejaVu Sans Mono", "Liberation Mono", "Courier New", Courier, monospace',
-      padding = "20px",
+      fontSize = styleDefaults.fontSize,
+      lineHeight = styleDefaults.lineHeight,
+      fontFamily = styleDefaults.fontFamily,
+      padding = styleDefaults.padding,
       theme = null,
       mobile = {}
     } = options;
@@ -1237,6 +1958,10 @@ var OverTypeEditor = (() => {
 
     .overtype-wrapper .overtype-input::selection {
       background-color: var(--selection, rgba(244, 211, 94, 0.4));
+    }
+
+    .overtype-wrapper .overtype-input::placeholder {
+      color: transparent !important;
     }
 
     /* Placeholder shim - visible when textarea is empty */
@@ -2911,6 +3636,7 @@ ${blockSuffix}` : suffix;
     create() {
       this.container = document.createElement("div");
       this.container.className = "overtype-toolbar";
+      this.editor._markChrome(this.container);
       this.container.id = this.getInstanceElementId("toolbar");
       this.container.setAttribute("role", "toolbar");
       this.container.setAttribute("aria-label", "Formatting toolbar");
@@ -3189,6 +3915,7 @@ ${blockSuffix}` : suffix;
     createViewModeDropdown(button) {
       const dropdown = document.createElement("div");
       dropdown.className = "overtype-dropdown-menu";
+      this.editor._markChrome(dropdown);
       dropdown.id = this.getInstanceElementId("toolbar-view-mode-menu");
       dropdown.setAttribute("role", "menu");
       dropdown.setAttribute("aria-label", "View mode");
@@ -4573,27 +5300,38 @@ ${blockSuffix}` : suffix;
       this.hideTimeout = null;
       this.visibilityChangeHandler = null;
       this.isTooltipHovered = false;
+      this.linkCacheText = null;
+      this.linkCache = [];
       this.init();
     }
     init() {
       this.createTooltip();
-      this.editor.textarea.addEventListener("selectionchange", () => this.checkCursorPosition());
-      this.editor.textarea.addEventListener("keyup", (e) => {
-        if (e.key.includes("Arrow") || e.key === "Home" || e.key === "End") {
-          this.checkCursorPosition();
+      this.textareaListeners = {
+        // Listen for cursor position changes
+        selectionchange: () => this.checkCursorPosition(),
+        keyup: (e) => {
+          if (e.key.includes("Arrow") || e.key === "Home" || e.key === "End") {
+            this.checkCursorPosition();
+          }
+        },
+        // Hide tooltip when typing
+        input: () => this.hide(),
+        // Reposition tooltip when scrolling
+        scroll: () => {
+          if (this.currentLink) {
+            this.positionTooltip(this.currentLink);
+          }
+        },
+        // Hide tooltip when textarea loses focus (unless hovering tooltip)
+        blur: () => {
+          if (!this.isTooltipHovered) {
+            this.hide();
+          }
         }
-      });
-      this.editor.textarea.addEventListener("input", () => this.hide());
-      this.editor.textarea.addEventListener("scroll", () => {
-        if (this.currentLink) {
-          this.positionTooltip(this.currentLink);
-        }
-      });
-      this.editor.textarea.addEventListener("blur", () => {
-        if (!this.isTooltipHovered) {
-          this.hide();
-        }
-      });
+      };
+      for (const [type, handler] of Object.entries(this.textareaListeners)) {
+        this.editor.textarea.addEventListener(type, handler);
+      }
       this.visibilityChangeHandler = () => {
         if (document.hidden) {
           this.hide();
@@ -4612,6 +5350,7 @@ ${blockSuffix}` : suffix;
     createTooltip() {
       this.tooltip = document.createElement("div");
       this.tooltip.className = "overtype-link-tooltip";
+      this.editor._markChrome(this.tooltip);
       this.tooltip.innerHTML = `
       <span style="display: flex; align-items: center; gap: 6px;">
         <svg width="12" height="12" viewBox="0 0 20 20" fill="currentColor" style="flex-shrink: 0;">
@@ -4647,22 +5386,25 @@ ${blockSuffix}` : suffix;
       }
     }
     findLinkAtPosition(text, position) {
-      const linkRegex = /\[([^\]]+)\]\(([^)]+)\)/g;
-      let match;
-      let linkIndex = 0;
-      while ((match = linkRegex.exec(text)) !== null) {
-        const start = match.index;
-        const end = match.index + match[0].length;
+      if (this.editor.options.showActiveLineRaw)
+        return null;
+      if (this.linkCacheText !== text) {
+        this.linkCacheText = text;
+        this.linkCache = MarkdownParser.findRenderableLinks(text);
+      }
+      const links = this.linkCache;
+      for (const [linkIndex, link] of links.entries()) {
+        const start = link.start;
+        const end = link.end;
         if (position >= start && position <= end) {
           return {
-            text: match[1],
-            url: this.transformUrl(match[2]),
+            text: link.text.raw,
+            url: this.transformUrl(link.destination.value),
             index: linkIndex,
             start,
             end
           };
         }
-        linkIndex++;
       }
       return null;
     }
@@ -4741,6 +5483,12 @@ ${blockSuffix}` : suffix;
     }
     destroy() {
       this.cancelHide();
+      if (this.textareaListeners) {
+        for (const [type, handler] of Object.entries(this.textareaListeners)) {
+          this.editor.textarea.removeEventListener(type, handler);
+        }
+        this.textareaListeners = null;
+      }
       if (this.visibilityChangeHandler) {
         document.removeEventListener("visibilitychange", this.visibilityChangeHandler);
         this.visibilityChangeHandler = null;
@@ -5086,6 +5834,7 @@ ${blockSuffix}` : suffix;
      * @private
      */
     _init(element, options = {}) {
+      var _a;
       this.element = element;
       this.instanceTheme = options.theme || null;
       this.options = this._mergeOptions(options);
@@ -5093,6 +5842,10 @@ ${blockSuffix}` : suffix;
       this.initialized = false;
       this._isSafari = isSafariBrowser();
       this._safariReflowRaf = null;
+      if (this.options.persist && !_OverType.stylesChrome) {
+        _OverType.stylesChrome = true;
+        (_a = document.querySelector("style.overtype-styles")) == null ? void 0 : _a.setAttribute("clay", "editor-ui");
+      }
       _OverType.injectStyles();
       _OverType.initGlobalListeners();
       const container = element.querySelector(".overtype-container");
@@ -5165,10 +5918,13 @@ ${blockSuffix}` : suffix;
         statsFormatter: null,
         smartLists: true,
         // Enable smart list continuation
+        clickToToggleTasks: false,
         codeHighlighter: null,
         // Per-instance code highlighter
         spellcheck: false,
         // Browser spellcheck (disabled by default)
+        persist: false,
+        // Keep only container, wrapper and textarea in a self-saving page (ClayJS)
         transformLinkUrl: null
         // Transform URLs shown/opened in the link tooltip
       };
@@ -5183,6 +5939,7 @@ ${blockSuffix}` : suffix;
      * @private
      */
     _recoverFromDOM(container, wrapper) {
+      const content = this._extractContent();
       if (container && container.classList.contains("overtype-container")) {
         this.container = container;
         this.wrapper = container.querySelector(".overtype-wrapper");
@@ -5190,35 +5947,38 @@ ${blockSuffix}` : suffix;
         this.wrapper = wrapper;
         this.container = document.createElement("div");
         this.container.className = "overtype-container";
-        const themeToUse = this.instanceTheme || _OverType.currentTheme || solar;
-        const themeName = typeof themeToUse === "string" ? themeToUse : themeToUse.name;
-        if (themeName) {
-          this.container.setAttribute("data-theme", themeName);
-        }
         if (this.instanceTheme) {
           const themeObj = typeof this.instanceTheme === "string" ? getTheme(this.instanceTheme) : this.instanceTheme;
           if (themeObj && themeObj.colors) {
-            const cssVars = themeToCSSVars(themeObj.colors);
-            this.container.style.cssText += cssVars;
+            this.container.style.cssText += themeToCSSVars(themeObj.colors);
           }
         }
         wrapper.parentNode.insertBefore(this.container, wrapper);
         this.container.appendChild(wrapper);
       }
-      if (!this.wrapper) {
+      this.textarea = this.wrapper ? this.wrapper.querySelector(".overtype-input") : null;
+      if (!this.textarea) {
         if (container)
           container.remove();
         if (wrapper)
           wrapper.remove();
-        this._buildFromScratch();
+        this._buildFromScratch(content);
         return;
       }
-      this.textarea = this.wrapper.querySelector(".overtype-input");
-      this.preview = this.wrapper.querySelector(".overtype-preview");
-      if (!this.textarea || !this.preview) {
-        this.container.remove();
-        this._buildFromScratch();
-        return;
+      const themeToUse = this.instanceTheme || _OverType.currentTheme || solar;
+      const themeName = typeof themeToUse === "string" ? themeToUse : themeToUse.name;
+      if (themeName) {
+        this.container.setAttribute("data-theme", themeName);
+      }
+      this.container.querySelectorAll(".overtype-toolbar, .overtype-link-tooltip, .overtype-stats, .overtype-placeholder, .overtype-preview").forEach((el) => el.remove());
+      this.container.classList.remove("overtype-auto-resize");
+      [this.wrapper, this.textarea].forEach((el) => {
+        el.style.removeProperty("height");
+        el.style.removeProperty("overflow-y");
+      });
+      this._createOverlay();
+      if (this.options.showStats) {
+        this._createStatsBar();
       }
       this.wrapper._instance = this;
       this._applyInstanceCSSVars();
@@ -5231,8 +5991,7 @@ ${blockSuffix}` : suffix;
      * Build editor from scratch
      * @private
      */
-    _buildFromScratch() {
-      const content = this._extractContent();
+    _buildFromScratch(content = this._extractContent()) {
       this.element.innerHTML = "";
       this._createDOM();
       if (content || this.options.value) {
@@ -5289,22 +6048,11 @@ ${blockSuffix}` : suffix;
         });
       }
       this._ensureTextareaId();
-      this.preview = document.createElement("div");
-      this.preview.className = "overtype-preview";
-      this.preview.setAttribute("aria-hidden", "true");
-      this.placeholderEl = document.createElement("div");
-      this.placeholderEl.className = "overtype-placeholder";
-      this.placeholderEl.setAttribute("aria-hidden", "true");
-      this.placeholderEl.textContent = this.options.placeholder;
       this.wrapper.appendChild(this.textarea);
-      this.wrapper.appendChild(this.preview);
-      this.wrapper.appendChild(this.placeholderEl);
+      this._createOverlay();
       this.container.appendChild(this.wrapper);
       if (this.options.showStats) {
-        this.statsBar = document.createElement("div");
-        this.statsBar.className = "overtype-stats";
-        this.container.appendChild(this.statsBar);
-        this._updateStats();
+        this._createStatsBar();
       }
       this.element.appendChild(this.container);
       if (this.options.autoResize) {
@@ -5313,6 +6061,43 @@ ${blockSuffix}` : suffix;
         this.container.classList.remove("overtype-auto-resize");
       }
       this._syncPreviewInteractivity();
+    }
+    /**
+     * Create the preview and placeholder layers inside the wrapper
+     * @private
+     */
+    _createOverlay() {
+      this.preview = document.createElement("div");
+      this.preview.className = "overtype-preview";
+      this.preview.setAttribute("aria-hidden", "true");
+      this.placeholderEl = document.createElement("div");
+      this.placeholderEl.className = "overtype-placeholder";
+      this.placeholderEl.setAttribute("aria-hidden", "true");
+      this.placeholderEl.textContent = this.options.placeholder;
+      this.wrapper.appendChild(this.preview);
+      this.wrapper.appendChild(this.placeholderEl);
+      this._markChrome(this.preview);
+      this._markChrome(this.placeholderEl);
+    }
+    /**
+     * Create the stats bar at the bottom of the container
+     * @private
+     */
+    _createStatsBar() {
+      this.statsBar = document.createElement("div");
+      this.statsBar.className = "overtype-stats";
+      this._markChrome(this.statsBar);
+      this.container.appendChild(this.statsBar);
+      this._updateStats();
+    }
+    /**
+     * Mark a UI node so a ClayJS self-saving page leaves it out of the saved file
+     * @private
+     */
+    _markChrome(el) {
+      if (this.options.persist && el) {
+        el.setAttribute("clay", "editor-ui");
+      }
     }
     /**
      * Configure textarea attributes
@@ -5326,15 +6111,23 @@ ${blockSuffix}` : suffix;
       this.textarea.setAttribute("data-gramm", "false");
       this.textarea.setAttribute("data-gramm_editor", "false");
       this.textarea.setAttribute("data-enable-grammarly", "false");
+      if (this.options.persist) {
+        this.textarea.setAttribute("persist", "");
+      }
     }
     /**
      * Ensure the textarea can be referenced by aria-controls
      * @private
      */
     _ensureTextareaId() {
-      if (!this.textarea.id) {
-        this.textarea.id = `overtype-${this.instanceId}-input`;
-      }
+      const id = this.textarea.id;
+      const isGenerated = /^overtype-\d+-input$/.test(id);
+      if (id && !(isGenerated && document.querySelectorAll(`[id="${id}"]`).length > 1))
+        return;
+      let n = this.instanceId;
+      while (document.getElementById(`overtype-${n}-input`))
+        n++;
+      this.textarea.id = `overtype-${n}-input`;
     }
     /**
      * Keep rendered preview content out of keyboard navigation until Preview mode.
@@ -5421,17 +6214,18 @@ ${blockSuffix}` : suffix;
     _applyInstanceCSSVars() {
       if (!this.wrapper)
         return;
-      if (this.options.fontSize) {
-        this.wrapper.style.setProperty("--instance-font-size", this.options.fontSize);
-      }
-      if (this.options.lineHeight) {
-        this.wrapper.style.setProperty("--instance-line-height", String(this.options.lineHeight));
-      }
-      if (this.options.padding) {
-        this.wrapper.style.setProperty("--instance-padding", this.options.padding);
-      }
-      if (this.options.fontFamily) {
-        this.wrapper.style.setProperty("--instance-font-family", this.options.fontFamily);
+      const vars = [
+        ["--instance-font-size", this.options.fontSize, styleDefaults.fontSize],
+        ["--instance-line-height", this.options.lineHeight, styleDefaults.lineHeight],
+        ["--instance-padding", this.options.padding, styleDefaults.padding],
+        ["--instance-font-family", this.options.fontFamily, styleDefaults.fontFamily]
+      ];
+      for (const [name, value, fallback] of vars) {
+        if (value && String(value) !== String(fallback)) {
+          this.wrapper.style.setProperty(name, String(value));
+        } else {
+          this.wrapper.style.removeProperty(name);
+        }
       }
     }
     /**
@@ -5495,12 +6289,7 @@ ${blockSuffix}` : suffix;
      * @private
      */
     _extractMarkdownUrls(text) {
-      const urls = [];
-      const re = /!?\[[^\]]*\]\(([^)\s]+)/g;
-      let m;
-      while ((m = re.exec(text)) !== null)
-        urls.push(m[1]);
-      return urls;
+      return MarkdownParser.findLinks(text, { allowEmptyText: true }).map((link) => link.destination.value);
     }
     /**
      * Track URLs that were just inserted, pairing each with the source File.
@@ -5511,8 +6300,13 @@ ${blockSuffix}` : suffix;
     _trackInsertedUrls(insertedText, file) {
       if (!this._uploadedFiles || !file || !insertedText)
         return;
-      for (const url of this._extractMarkdownUrls(insertedText)) {
-        this._uploadedFiles.set(url, { filename: file.name, file });
+      const links = MarkdownParser.findLinks(insertedText, { allowEmptyText: true });
+      for (const link of links) {
+        this._uploadedFiles.set(link.destination.value, {
+          filename: file.name,
+          file,
+          markdownDestination: link.destination.raw
+        });
       }
     }
     /**
@@ -5526,10 +6320,13 @@ ${blockSuffix}` : suffix;
         return;
       const cb = (_a = this.options.fileUpload) == null ? void 0 : _a.onRemoveFile;
       const value = this.textarea.value;
+      const currentUrls = new Set(this._extractMarkdownUrls(this.textarea.value));
       const removed = [];
       for (const [url, info] of this._uploadedFiles) {
-        if (!value.includes(url))
+        const rawDestination = info.markdownDestination || url;
+        if (!currentUrls.has(url) && !value.includes(rawDestination)) {
           removed.push({ url, info });
+        }
       }
       for (const { url, info } of removed) {
         this._uploadedFiles.delete(url);
@@ -5606,6 +6403,77 @@ ${blockSuffix}` : suffix;
       this._boundHandleDragOver = null;
       this._uploadedFiles = null;
       this.fileUploadInitialized = false;
+    }
+    _handleTaskClick(event) {
+      if (!this.options.clickToToggleTasks || event.button !== 0 || !this._canEditTextarea() || this.container.dataset.mode === "preview")
+        return;
+      const taskNodes = [...this.preview.querySelectorAll("li.task-list, div.raw-line")].filter((node) => node.matches("li.task-list") || /^ *-\s+\[[ xX]\](?:\s|$)/.test(node.textContent));
+      let nodeIndex = 0;
+      let offset3 = 0;
+      let opening = null;
+      for (const line of this.textarea.value.split("\n")) {
+        if (opening) {
+          if (scanFenceClose(line, opening))
+            opening = null;
+          offset3 += line.length + 1;
+          continue;
+        }
+        opening = scanFenceOpen(line);
+        if (opening) {
+          offset3 += line.length + 1;
+          continue;
+        }
+        const match = /^( *-\s+\[)([ xX])\](?:\s|$)/.exec(line);
+        if (!match || !MarkdownParser.parseLine(line).includes('<li class="task-list">')) {
+          offset3 += line.length + 1;
+          continue;
+        }
+        const node = taskNodes[nodeIndex++];
+        const marker = (node == null ? void 0 : node.matches("li.task-list")) ? node.querySelector(":scope > .syntax-marker") : node;
+        const textNode = marker == null ? void 0 : marker.firstChild;
+        if ((textNode == null ? void 0 : textNode.nodeType) === 3) {
+          const inside = textNode.textContent.indexOf("[") + 1;
+          if (!/^\[[ xX]\]$/.test(textNode.textContent.slice(inside - 1, inside + 2))) {
+            offset3 += line.length + 1;
+            continue;
+          }
+          const range = document.createRange();
+          range.setStart(textNode, inside - 1);
+          range.setEnd(textNode, inside + 2);
+          const hit = [...range.getClientRects()].some((rect) => event.clientX >= rect.left && event.clientX < rect.right && event.clientY >= rect.top && event.clientY < rect.bottom);
+          if (hit) {
+            const textarea = this.textarea;
+            const start = textarea.selectionStart;
+            const end = textarea.selectionEnd;
+            const direction = textarea.selectionDirection;
+            const position = offset3 + match[1].length;
+            textarea.focus();
+            textarea.setSelectionRange(position, position + 1);
+            const replacement = match[2] === " " ? "x" : " ";
+            let inputFired = false;
+            const trackInput = () => {
+              inputFired = true;
+            };
+            textarea.addEventListener("input", trackInput);
+            let inserted = false;
+            try {
+              inserted = document.execCommand("insertText", false, replacement);
+            } catch (_) {
+            } finally {
+              textarea.removeEventListener("input", trackInput);
+            }
+            if (!inserted) {
+              textarea.setRangeText(replacement, position, position + 1, "preserve");
+            }
+            if (!inputFired) {
+              textarea.dispatchEvent(new Event("input", { bubbles: true }));
+            }
+            textarea.setSelectionRange(start, end, direction);
+            return;
+          }
+        }
+        offset3 += line.length + 1;
+      }
     }
     insertAtCursor(text) {
       const start = this.textarea.selectionStart;
@@ -6148,8 +7016,11 @@ ${blockSuffix}` : suffix;
       this.container.classList.add("overtype-auto-resize");
       this.previousHeight = null;
       this._updateAutoHeight();
-      this.textarea.addEventListener("input", () => this._updateAutoHeight());
-      window.addEventListener("resize", () => this._updateAutoHeight());
+      if (!this._autoResizeHandler) {
+        this._autoResizeHandler = () => this._updateAutoHeight();
+        this.textarea.addEventListener("input", this._autoResizeHandler);
+        window.addEventListener("resize", this._autoResizeHandler);
+      }
     }
     /**
      * Update height based on scrollHeight
@@ -6205,10 +7076,7 @@ ${blockSuffix}` : suffix;
     showStats(show) {
       this.options.showStats = show;
       if (show && !this.statsBar) {
-        this.statsBar = document.createElement("div");
-        this.statsBar.className = "overtype-stats";
-        this.container.appendChild(this.statsBar);
-        this._updateStats();
+        this._createStatsBar();
       } else if (show && this.statsBar) {
         this._updateStats();
       } else if (!show && this.statsBar) {
@@ -6277,10 +7145,30 @@ ${blockSuffix}` : suffix;
         cancelAnimationFrame(this._safariReflowRaf);
         this._safariReflowRaf = null;
       }
+      if (this.linkTooltip) {
+        this.linkTooltip.destroy();
+        this.linkTooltip = null;
+      }
+      if (this.toolbar) {
+        this._cleanupToolbarListeners();
+        this.toolbar.destroy();
+        this.toolbar = null;
+      }
+      if (this._autoResizeHandler) {
+        this.textarea.removeEventListener("input", this._autoResizeHandler);
+        window.removeEventListener("resize", this._autoResizeHandler);
+        this._autoResizeHandler = null;
+      }
       if (this.wrapper) {
-        const content = this.getValue();
-        this.wrapper.remove();
-        this.element.textContent = content;
+        if (this.options.persist) {
+          [this.preview, this.placeholderEl, this.statsBar].forEach((el) => el == null ? void 0 : el.remove());
+          this.statsBar = null;
+          this.wrapper._instance = null;
+        } else {
+          const content = this.getValue();
+          this.wrapper.remove();
+          this.element.textContent = content;
+        }
       }
       this.initialized = false;
     }
@@ -6418,6 +7306,9 @@ ${blockSuffix}` : suffix;
       const styles = generateStyles({ theme });
       const styleEl = document.createElement("style");
       styleEl.className = "overtype-styles";
+      if (_OverType.stylesChrome) {
+        styleEl.setAttribute("clay", "editor-ui");
+      }
       styleEl.textContent = styles;
       document.head.appendChild(styleEl);
       _OverType.stylesInjected = true;
@@ -6449,7 +7340,8 @@ ${blockSuffix}` : suffix;
       _OverType.injectStyles(true);
       const themeName = typeof themeObj === "string" ? themeObj : themeObj.name;
       document.querySelectorAll(".overtype-container").forEach((container) => {
-        if (themeName) {
+        const wrapper = container.querySelector(".overtype-wrapper");
+        if (themeName && wrapper && wrapper._instance) {
           container.setAttribute("data-theme", themeName);
         }
       });
@@ -6571,6 +7463,14 @@ ${blockSuffix}` : suffix;
             instance.handleKeydown(e);
         }
       });
+      document.addEventListener("click", (e) => {
+        if (e.target && e.target.classList && e.target.classList.contains("overtype-input")) {
+          const wrapper = e.target.closest(".overtype-wrapper");
+          const instance = wrapper == null ? void 0 : wrapper._instance;
+          if (instance)
+            instance._handleTaskClick(e);
+        }
+      });
       document.addEventListener("focus", (e) => {
         if (e.target && e.target.classList && e.target.classList.contains("overtype-input")) {
           const wrapper = e.target.closest(".overtype-wrapper");
@@ -6617,6 +7517,7 @@ ${blockSuffix}` : suffix;
   // Static properties
   __publicField(_OverType, "instances", /* @__PURE__ */ new WeakMap());
   __publicField(_OverType, "stylesInjected", false);
+  __publicField(_OverType, "stylesChrome", false);
   __publicField(_OverType, "globalListenersInitialized", false);
   __publicField(_OverType, "instanceCount", 0);
   __publicField(_OverType, "_autoMediaQuery", null);
@@ -6755,6 +7656,11 @@ ${blockSuffix}` : suffix;
           this._editor.textarea.addEventListener("keydown", (e) => {
             if (this._editor && this._editor.handleKeydown) {
               this._editor.handleKeydown(e);
+            }
+          });
+          this._editor.textarea.addEventListener("click", (e) => {
+            if (this._editor) {
+              this._editor._handleTaskClick(e);
             }
           });
           this._selectionChangeHandler = () => {

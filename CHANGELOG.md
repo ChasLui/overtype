@@ -1,5 +1,66 @@
 # Changelog
 
+## [2.6.0] - 2026-10-05
+
+### Added
+- Opt-in task toggling by clicking inside a task's brackets
+
+### Fixed
+- The native textarea placeholder is now hidden behind the placeholder shim
+- The link tooltip's textarea listeners are now removed on destroy
+
+
+
+## [Unreleased]
+
+### Fixed
+- `destroy()` removes the link tooltip's textarea listeners, so typing in a `persist` editor after destroying and reopening it no longer throws
+- The textarea's native placeholder is hidden, so it no longer shows under the placeholder shim (visible as doubled text when the shim is styled differently)
+
+## [2.5.0] - 2026-09-25
+
+### Added
+- `persist: true` option for self-saving pages (ClayJS / Hyperclay): the textarea gets the `persist` attribute and every UI node (style tag, toolbar, view-mode dropdown, link tooltip, stats bar, placeholder, preview) is marked `clay="editor-ui"`, so a saved editor is only its container, wrapper and textarea. `destroy()` then leaves that shell in place so the editor can be resumed
+
+### Fixed
+- Resuming from saved DOM no longer duplicates the toolbar and link tooltip on every reload, keeps the stats bar and placeholder live, and keeps the text when the saved DOM has a textarea but no preview
+- Generated textarea ids no longer collide with ids saved by an earlier page load
+- autoResize keeps working after resuming from saved DOM
+- `destroy()` releases the toolbar, link tooltip and autoResize listeners
+- A global theme change no longer rewrites editors that have no live instance
+- Indented task list items render on one row, keeping the preview aligned with the textarea
+
+### Changed
+- Instance CSS variables are written only when they differ from the stylesheet default, so a default editor carries far less inline style
+
+## [2.4.2] - 2026-09-05
+
+### Added
+- CommonMark 0.31.2 conformance tests covering source fidelity for all 652 examples and semantic policies for every advertised Markdown feature section
+
+### Changed
+- Emphasis and strong emphasis now use CommonMark delimiter run rules within each source line
+- H1 through H3 headings, thematic breaks, block quotes, flat lists, and backtick fences now recognize markers from raw source text before escaping
+
+### Fixed
+- Preserve tabs, nonbreaking spaces, and repeated whitespace after block markers
+- Keep browser and Node fence rendering identical, including unmatched fences and fences longer than three backticks
+- Preserve ordered list start values and CommonMark code indentation semantics without changing source-aligned rendering
+- Keep emphasis flanking correct around protected code, leading indentation, and Unicode symbols
+- Apply custom syntax processing to both fence rows while retaining list consolidation for decorated rows
+- Keep link tooltip indices synchronized across indented and variable-length code fences
+- Preserve code block state when the active line is raw, and accept highlighter output with one trailing newline
+- Keep smart list continuation and public block parser helpers aligned with rendered block recognition
+
+## [2.4.1] - 2026-09-04
+
+### Changed
+- Inline links now follow the CommonMark destination and title grammar. Malformed forms with unescaped spaces, unbalanced parentheses, or unterminated titles remain visible as source text instead of rendering as links.
+
+### Fixed
+- Parse link titles containing parentheses without truncating the link or mixing the title into its destination (#122)
+- Use one link scanner for parser rendering, link tooltips, and upload URL tracking
+
 ## [2.4.0] - 2026-06-18
 
 ### Added
@@ -181,8 +242,6 @@ All notable changes to OverType will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-## [Unreleased]
 
 ## [2.0.6] - 2025-11-19
 
